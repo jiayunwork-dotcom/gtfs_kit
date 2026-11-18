@@ -778,11 +778,22 @@ def restrict_to_agencies(feed: "Feed", agency_ids: list[str]) -> "Feed":
     return feed.restrict_to_routes(route_ids)
 
 
-def restrict_to_dates(feed: "Feed", dates: list[str]) -> "Feed":
+def restrict_to_dates(
+    feed: "Feed", dates: list[str], *, exact: bool = False
+) -> "Feed":
     """
     Build a new feed by restricting this one via :func:`restrict_to_trips` and
     the trips active on at least one of the given dates (YYYYMMDD strings).
     Return the resulting feed.
+
+    If ``exact`` (the default is ``False`` to preserve the historical
+    behaviour), then additionally rewrite the service calendar so that the
+    retained trips run on exactly the given dates and nowhere else, even when
+    the date list skips days.  Concretely, ``calendar`` is dropped and
+    ``calendar_dates`` is rebuilt with one type-1 (added) exception per
+    (service, date) pair that is active in the original feed on that date.
+    Retained trip activity on each given date is identical to the original
+    feed's activity there.
     """
     # Get every trip that is active on at least one of the dates
     trip_activity = feed.compute_trip_activity(dates)
@@ -794,7 +805,17 @@ def restrict_to_dates(feed: "Feed", dates: list[str]) -> "Feed":
             "trip_id",
         ]
 
-    return restrict_to_trips(feed, trip_ids)
+    new_feed = restrict_to_trips(feed, trip_ids)
+
+    if exact:
+        from .itineraries import build_exact_calendar
+
+        service_ids = set(new_feed.trips["service_id"])
+        new_feed.calendar, new_feed.calendar_dates = build_exact_calendar(
+            feed, service_ids, dates
+        )
+
+    return new_feed
 
 
 def restrict_to_area(feed: "Feed", area: gpd.GeoDataFrame) -> "Feed":

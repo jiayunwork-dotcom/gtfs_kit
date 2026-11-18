@@ -23,6 +23,7 @@ from . import constants as cs
 from . import calendar as cl
 from . import cleaners as cn
 from . import helpers as hp
+from . import itineraries as iz
 from . import miscellany as ms
 from . import routes as rt
 from . import shapes as shp
@@ -283,6 +284,8 @@ _FEED_METHODS = {
     "get_start_and_end_times": st.get_start_and_end_times,
     "get_stop_times": st.get_stop_times,
     "stop_times_to_geojson": st.stop_times_to_geojson,
+    # itineraries
+    "build_itinerary_feed": iz.build_itinerary_feed,
     # stops
     "build_geometry_by_stop": sp.build_geometry_by_stop,
     "build_stop_timetable": sp.build_stop_timetable,

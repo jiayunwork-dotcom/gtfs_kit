@@ -16,6 +16,7 @@ import pandas as pd
 
 from . import constants as cs
 from . import helpers as hp
+from .itineraries import alightable_mask, boardable_mask
 
 # Help mypy but avoid circular imports
 if TYPE_CHECKING:
@@ -561,7 +562,14 @@ def compute_stop_time_series(
     return pd.concat(frames, ignore_index=True)
 
 
-def build_stop_timetable(feed: "Feed", stop_id: str, dates: list[str]) -> pd.DataFrame:
+def build_stop_timetable(
+    feed: "Feed",
+    stop_id: str,
+    dates: list[str],
+    *,
+    board_only: bool = False,
+    alight_only: bool = False,
+) -> pd.DataFrame:
     """
     Return a (possibly empty) DataFrame containing the timetable for the given stop ID
     and dates (YYYYMMDD date strings).
@@ -569,6 +577,14 @@ def build_stop_timetable(feed: "Feed", stop_id: str, dates: list[str]) -> pd.Dat
     ``feed.stop_times`` plus ``'date'``, and the stop IDs are restricted to the given
     stop ID.
     The result is sorted by date then departure time.
+
+    If ``board_only``, then keep only stop events usable for boarding:
+    ``pickup_type`` is 0 or missing and the event has a departure time.
+    If ``alight_only``, then keep only stop events usable for alighting:
+    ``drop_off_type`` is 0 or missing and the event has an arrival time.
+    Both filters may be combined, and they apply the same usable-stop-event
+    semantics as :func:`.itineraries.build_itinerary_feed`.
+    The default call (both ``False``) preserves the historical behaviour.
     """
     dates = feed.subset_dates(dates)
     if not dates:
@@ -577,6 +593,10 @@ def build_stop_timetable(feed: "Feed", stop_id: str, dates: list[str]) -> pd.Dat
 
     # Get trips that visit the stop
     st = feed.stop_times.loc[lambda x: x["stop_id"] == stop_id]
+    if board_only:
+        st = st.loc[boardable_mask(st)]
+    if alight_only:
+        st = st.loc[alightable_mask(st)]
     t = feed.trips.merge(st, on="trip_id")
 
     # Restrict to trips active on dates and reshape

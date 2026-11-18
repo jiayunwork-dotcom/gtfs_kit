@@ -1,6 +1,12 @@
 Changelog
 =========
 
+Unreleased
+----------
+- Added ``Feed.build_itinerary_feed`` (module ``itineraries``): an entry point that takes a required-itinerary list and a ``stop_times`` row budget and returns a savable reduced Feed plus an ordered audit report.  Journeys are direct or one-transfer within one GTFS service day under explicit boarding/alighting and stop-level transfer rules; the search is exhaustive at up to 16 candidate trips and 8 itineraries and reports ``unreachable``, ``infeasible``, or ``undetermined`` without delivering a partial feed.
+- Added optional ``board_only`` and ``alight_only`` filters to ``build_stop_timetable`` sharing the same usable-stop-event semantics as the itinerary planner.
+- Added an ``exact`` option to ``restrict_to_dates`` that rewrites the service calendar so retained trips run on exactly the named dates, including skipped days and calendar exceptions.
+
 12.0.3, 2026-03-12
 ------------------
 - Migrated project packaging to Hatchling.

@@ -3,6 +3,7 @@ from .cleaners import *
 from .constants import *
 from .feed import *
 from .helpers import *
+from .itineraries import *
 from .miscellany import *
 from .routes import *
 from .shapes import *
