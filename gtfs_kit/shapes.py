@@ -13,13 +13,14 @@ import shapely.geometry as sg
 
 from . import constants as cs
 from . import helpers as hp
+from . import calibration as cb
 
 # Help mypy but avoid circular imports
 if TYPE_CHECKING:
     from .feed import Feed
 
 
-def append_dist_to_shapes(feed: "Feed") -> "Feed":
+def append_dist_to_shapes(feed: "Feed", *, calibrated: bool = False) -> "Feed":
     """
     Calculate and append the optional ``shape_dist_traveled`` field in
     ``feed.shapes`` in terms of the distance units ``feed.dist_units``.
@@ -29,9 +30,52 @@ def append_dist_to_shapes(feed: "Feed") -> "Feed":
     <https://transitfeeds.com/p/trimet/43/1400947517>`_
     produces a ``shape_dist_traveled`` column that differs by at most
     0.016 km in absolute value from of the original values.
+
+    If ``calibrated`` is true, then instead prepare a *calibrated* distance
+    ruler along each shape, suitable for :func:`.stop_times.append_dist_to_stop_times`
+    and :func:`.trips.locate_trips` with ``calibrated=True``:
+
+    - Each shape's vertices are ordered by ``shape_pt_sequence``.
+    - If a shape already has a complete ``shape_dist_traveled`` column
+      (every value present, finite, non-negative, and strictly increasing
+      along the sequence), it is kept verbatim.  The first value need not
+      be zero.
+    - Otherwise, if the column is entirely absent for the shape, distances
+      are generated from the shape geometry in ``feed.dist_units``.
+    - A partially filled column, invalid values, duplicate
+      ``shape_pt_sequence`` values, or coincident adjacent vertices raise a
+      ``ValueError`` naming the offending ``shape_id``.
+
+    The input feed is never modified; a copy is returned.
     """
     if feed.shapes is None:
         raise ValueError("This function requires the feed to have a shapes.txt file")
+
+    if calibrated:
+        # Validate and prepare, raising errors that name the shape ID.
+        records = cb.prepare_shape_distances(
+            feed.shapes, feed.dist_units, generate_missing=True
+        )
+        feed = feed.copy()
+        new_shapes = feed.shapes.copy()
+        dist_by_shape = {s: rec["dist"] for s, rec in records.items()}
+        ordered = new_shapes.sort_values(["shape_id", "shape_pt_sequence"], kind="stable")
+        pieces = []
+        for shape_id, group in ordered.groupby("shape_id", sort=False):
+            group = group.copy()
+            group["shape_dist_traveled"] = dist_by_shape[shape_id]
+            pieces.append(group)
+        if pieces:
+            new_shapes = pd.concat(pieces, ignore_index=True)
+        else:
+            new_shapes = new_shapes.assign(shape_dist_traveled=pd.Series(dtype="float64"))
+        # Preserve column order, appending the distance column if needed.
+        cols = list(new_shapes.columns)
+        if "shape_dist_traveled" not in cols:
+            cols = cols + ["shape_dist_traveled"]
+        new_shapes = new_shapes[cols].reset_index(drop=True)
+        feed.shapes = new_shapes
+        return feed
 
     feed = feed.copy()
 

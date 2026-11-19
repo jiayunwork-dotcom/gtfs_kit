@@ -6,9 +6,10 @@ from __future__ import annotations
 from typing import Iterable, TYPE_CHECKING
 import json
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
+from . import calibration as cb
 from . import helpers as hp
 
 # Help mypy but avoid circular imports
@@ -31,7 +32,193 @@ def get_stop_times(feed: "Feed", date: str | None = None) -> pd.DataFrame:
     return f
 
 
-def append_dist_to_stop_times(feed: "Feed") -> "Feed":
+def _validate_max_offset_m(max_offset_m) -> float:
+    """
+    Return ``max_offset_m`` after checking that it is a finite positive number.
+    """
+    if max_offset_m is None:
+        raise ValueError(
+            "append_dist_to_stop_times(calibrated=True) requires a finite "
+            "positive max_offset_m (in meters)"
+        )
+    try:
+        value = float(max_offset_m)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "max_offset_m must be a finite positive number of meters; "
+            f"got {max_offset_m!r}"
+        )
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError(
+            "max_offset_m must be a finite positive number of meters; "
+            f"got {max_offset_m!r}"
+        )
+    return value
+
+
+def _calibrated_stop_times(feed: "Feed", max_offset_m: float) -> "Feed":
+    """
+    Implementation of the calibrated branch of
+    :func:`append_dist_to_stop_times`.
+    """
+    if feed.stop_times is None:
+        return feed
+
+    has_shapes = feed.shapes is not None and not feed.shapes.empty
+    trips = feed.trips
+    if trips is None:
+        return feed
+
+    if "shape_id" not in trips.columns:
+        # No shape references at all: everything stays blank.
+        new_feed = feed.copy()
+        new_feed.stop_times = feed.stop_times.assign(shape_dist_traveled=np.nan)
+        return new_feed
+
+    shape_id_by_trip = dict(zip(trips["trip_id"], trips["shape_id"]))
+
+    def referenced_shape(trip_id):
+        return shape_id_by_trip.get(trip_id, np.nan)
+
+    # A trip that references a shape requires a shapes table.
+    if not has_shapes:
+        for trip_id in feed.stop_times["trip_id"].unique():
+            shape_id = referenced_shape(trip_id)
+            if not pd.isna(shape_id):
+                cb.check_trip_id(
+                    trip_id,
+                    f"references shape_id {shape_id!r}, but the feed has no shapes",
+                )
+        new_feed = feed.copy()
+        new_feed.stop_times = feed.stop_times.assign(shape_dist_traveled=np.nan)
+        return new_feed
+
+    # Prepare the vertex distance ruler for every shape from the mileage that
+    # append_dist_to_shapes(calibrated=True) prepared.  A shape whose mileage
+    # is missing or invalid raises an error naming that shape, pointing the
+    # caller back at the preparation step.
+    records = cb.prepare_shape_distances(
+        feed.shapes, feed.dist_units, generate_missing=False
+    )
+
+    # Stops in WGS84, later reprojected to the shapes' common UTM CRS.
+    import geopandas as gpd
+    import shapely
+
+    if feed.stops is None:
+        raise ValueError("append_dist_to_stop_times(calibrated=True) requires feed.stops")
+    stop_points = gpd.GeoSeries(
+        gpd.points_from_xy(feed.stops["stop_lon"], feed.stops["stop_lat"]),
+        index=feed.stops["stop_id"].to_numpy(),
+        crs="EPSG:4326",
+    )
+    stop_points = stop_points[~stop_points.index.duplicated(keep="first")]
+    known_stops = set(stop_points.index)
+
+    geoms = cb.build_shape_geometries(records)
+    # Reproject stops into the same UTM CRS used for the shapes.
+    utm_crs = next(iter(geoms.values())).utm_crs if geoms else None
+    if stop_points.empty or utm_crs is None:
+        stop_xy = {}
+    else:
+        projected = stop_points.to_crs(utm_crs)
+        values = projected.values
+        stop_xy = {
+            stop_id: (float(x), float(y))
+            for stop_id, x, y in zip(
+                stop_points.index,
+                shapely.get_x(values),
+                shapely.get_y(values),
+            )
+        }
+
+    tol = {s: cb.dist_tolerance(g.d_min, g.d_max) for s, g in geoms.items()}
+
+    had_column = "shape_dist_traveled" in feed.stop_times.columns
+    st = feed.stop_times.copy()
+    if not had_column:
+        st["shape_dist_traveled"] = np.nan
+    st["shape_dist_traveled"] = st["shape_dist_traveled"].astype("float64")
+
+    # Work on a canonical ordering, then restore it, so that permuting the
+    # input rows cannot change the result keyed by (trip_id, stop_sequence).
+    order = np.arange(len(st))
+    st = st.assign(__order=order).sort_values(["trip_id", "stop_sequence"], kind="stable")
+    out_values = {}
+
+    for trip_id, group in st.groupby("trip_id", sort=False):
+        shape_id = referenced_shape(trip_id)
+        if pd.isna(shape_id):
+            # Leave trips without a shape blank.
+            continue
+        if shape_id not in geoms:
+            cb.check_trip_id(trip_id, f"references unknown shape_id {shape_id!r}")
+        geom = geoms[shape_id]
+
+        stop_ids = group["stop_id"].tolist()
+        for stop_id in stop_ids:
+            if pd.isna(stop_id) or stop_id not in known_stops:
+                cb.check_trip_id(
+                    trip_id,
+                    f"references unknown stop_id {stop_id!r}",
+                )
+        stops_xy = [stop_xy[stop_id] for stop_id in stop_ids]
+        anchors = [
+            None if pd.isna(v) else float(v)
+            for v in group["shape_dist_traveled"].tolist()
+        ]
+
+        matched = cb.match_trip_distances(
+            geom,
+            stops_xy,
+            stop_ids,
+            max_offset_m,
+            anchors,
+            trip_id=trip_id,
+        )
+        if matched is None:
+            cb.check_trip_id(
+                trip_id,
+                f"no stop-to-shape matching stays within {max_offset_m} m of "
+                f"shape_id {shape_id!r} in stop_sequence order",
+            )
+
+        # Validate distances against the shape's ruler once more (cheap) and
+        # store by original row position.
+        g_tol = tol[shape_id]
+        for (_, row), d in zip(group.iterrows(), matched):
+            if d < geom.d_min - g_tol or d > geom.d_max + g_tol:
+                cb.check_trip_id(
+                    trip_id,
+                    f"shape_dist_traveled {d!r} at stop_sequence "
+                    f"{row['stop_sequence']} lies outside shape "
+                    f"{shape_id!r}",
+                )
+            out_values[row["__order"]] = d
+
+    new_st = st.copy()
+    new_st["shape_dist_traveled"] = [
+        out_values.get(position, np.nan) for position in new_st["__order"]
+    ]
+    # Restore original row order.
+    new_st = new_st.sort_values("__order").drop(columns="__order").reset_index(drop=True)
+
+    # Keep column order: original columns, then shape_dist_traveled.
+    cols = [c for c in feed.stop_times.columns if c != "shape_dist_traveled"]
+    cols = cols + ["shape_dist_traveled"]
+    new_st = new_st[cols]
+
+    new_feed = feed.copy()
+    new_feed.stop_times = new_st
+    return new_feed
+
+
+def append_dist_to_stop_times(
+    feed: "Feed",
+    *,
+    calibrated: bool = False,
+    max_offset_m: float | None = None,
+) -> "Feed":
     """
     Calculate and append the optional ``shape_dist_traveled`` column in
     ``feed.stop_times`` in terms of the distance units ``feed.dist_units``.
@@ -52,7 +239,34 @@ def append_dist_to_stop_times(feed: "Feed") -> "Feed":
     Choose the longest increasing subsequence of that new set of
     distances and use them and their corresponding departure times to linearly
     interpolate the rest of the distances.
+
+    If ``calibrated`` is true, then match each stop of each trip against the
+    *calibrated* vertex distance ruler prepared by
+    :func:`.shapes.append_dist_to_shapes` with ``calibrated=True``.
+    In that mode ``max_offset_m`` (a finite positive number of meters) is
+    required, and:
+
+    - Each trip is matched independently, walking its stops in
+      ``stop_sequence`` order.  Distances may stay equal but must not
+      decrease.
+    - A stop may be matched to any pass of the shape within ``max_offset_m``
+      meters, so loops and fold-backs that revisit a stop are handled: the
+      stop's permitted distances are all the parts of the polyline inside the
+      matching circle.
+    - Existing ``shape_dist_traveled`` values are treated as anchors: they
+      are kept verbatim, but must still lie on the shape and within the
+      radius of their stop.
+    - All other stops are filled in, including stops without departure times.
+    - If a trip cannot be matched, or references an unknown shape or stop,
+      a ``ValueError`` naming the ``trip_id`` is raised.
+    - Trips without a ``shape_id`` keep blank (NaN) distances.
+
+    The input feed is never modified; a copy is returned.
     """
+    if calibrated:
+        radius = _validate_max_offset_m(max_offset_m)
+        return _calibrated_stop_times(feed, radius)
+
     if feed.shapes is None or feed.shapes.empty:
         return feed
 

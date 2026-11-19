@@ -38,9 +38,11 @@ def get_active_services(feed: "Feed", date: str) -> list[str]:
         # Filter `calendar` to services active on date
         active_services |= set(
             feed.calendar.loc[
-                lambda x: (x["start_date"] <= date)
-                & (x["end_date"] >= date)
-                & (x[weekday_str] == 1),
+                lambda x: (
+                    (x["start_date"] <= date)
+                    & (x["end_date"] >= date)
+                    & (x[weekday_str] == 1)
+                ),
                 "service_id",
             ]
         )
@@ -409,7 +411,245 @@ def compute_trip_stats(
     return h.sort_values(["route_id", "direction_id", "start_time"], ignore_index=True)
 
 
-def locate_trips(feed: "Feed", date: str, times: list[str]) -> pd.DataFrame:
+def _locate_trips_calibrated(feed: "Feed", date: str, times: list[str]) -> pd.DataFrame:
+    """
+    Implementation of :func:`locate_trips` with ``calibrated=True``.
+
+    Positions are computed from the calibrated vertex distance ruler of each
+    shape (see :func:`.shapes.append_dist_to_shapes`): stop times are
+    interpolated linearly in time between stops that have departure times,
+    and the resulting distance is mapped to a point using the vertex ruler.
+    """
+    from . import calibration as cb
+
+    st = feed.stop_times
+    if st is None or feed.trips is None:
+        raise ValueError("locate_trips requires feed.stop_times and feed.trips")
+
+    if "shape_id" not in feed.trips.columns:
+        raise ValueError("feed.trips.shape_id must exist.")
+
+    if "shape_dist_traveled" not in st.columns:
+        # Point at a trip that would have been located, to satisfy the
+        # "name the offending trip_id" rule.
+        shape_by_trip = dict(zip(feed.trips["trip_id"], feed.trips["shape_id"]))
+        for trip_id in st["trip_id"].unique():
+            if not pd.isna(shape_by_trip.get(trip_id, np.nan)):
+                cb.check_trip_id(
+                    trip_id,
+                    "stop_times has no shape_dist_traveled column; run "
+                    "append_dist_to_stop_times(calibrated=True, ...) first",
+                )
+
+    active = feed.get_stop_times(date)
+    if active is None or active.empty:
+        empty = pd.DataFrame(
+            columns=[
+                "route_id",
+                "trip_id",
+                "direction_id",
+                "shape_id",
+                "time",
+                "rel_dist",
+                "lon",
+                "lat",
+            ]
+        )
+        return empty
+
+    if feed.shapes is not None and not feed.shapes.empty:
+        shapes_by_id = {
+            shape_id: group
+            for shape_id, group in feed.shapes.groupby("shape_id", sort=False)
+        }
+    else:
+        shapes_by_id = {}
+    records = {}
+
+    trip_info = feed.trips.copy()
+    if "direction_id" not in trip_info.columns:
+        trip_info["direction_id"] = np.nan
+    info_by_trip = {
+        row["trip_id"]: row
+        for _, row in trip_info[
+            ["trip_id", "route_id", "direction_id", "shape_id"]
+        ].iterrows()
+    }
+
+    sample_times = np.array([hp.timestr_to_seconds(s) for s in times], dtype=float)
+
+    rows = []
+    geoms = {}
+
+    def record_for(shape_id, trip_id):
+        """
+        Prepare (once) and return the calibrated vertex ruler for a shape,
+        reporting problems against the trip that uses it.
+        """
+        if shape_id not in records:
+            if shape_id not in shapes_by_id:
+                cb.check_trip_id(trip_id, f"references unknown shape_id {shape_id!r}")
+            try:
+                prepared = cb.prepare_shape_distances(
+                    shapes_by_id[shape_id], feed.dist_units, generate_missing=False
+                )
+            except ValueError as exc:
+                cb.check_trip_id(trip_id, f"unusable shape mileage ({exc})")
+            records[shape_id] = prepared[shape_id]
+        return records[shape_id]
+
+    def tol_for(shape_id):
+        rec = records[shape_id]
+        return cb.dist_tolerance(rec["dist"][0], rec["dist"][-1])
+
+    active = active.sort_values(["trip_id", "stop_sequence"], kind="stable")
+    for trip_id, group in active.groupby("trip_id", sort=False):
+        info = info_by_trip.get(trip_id)
+        shape_id = info["shape_id"] if info is not None else np.nan
+        if pd.isna(shape_id):
+            # Trips without a shape cannot be located.
+            continue
+
+        record = record_for(shape_id, trip_id)
+        try:
+            dists_all = group["shape_dist_traveled"].to_numpy(
+                dtype=float, na_value=np.nan
+            )
+        except (TypeError, ValueError):
+            cb.check_trip_id(
+                trip_id,
+                "stop_times.shape_dist_traveled is not numeric",
+            )
+        seq = group["stop_sequence"].to_numpy()
+
+        # Missing mileage is an error for a trip that has a shape.
+        missing = pd.isna(dists_all)
+        if missing.any():
+            bad = seq[missing]
+            cb.check_trip_id(
+                trip_id,
+                "missing shape_dist_traveled at stop_sequence "
+                + ", ".join(str(s) for s in bad[:5])
+                + (" ..." if len(bad) > 5 else ""),
+            )
+
+        shape_dist = record["dist"]
+        d_min, d_max = float(shape_dist[0]), float(shape_dist[-1])
+        tol = tol_for(shape_id)
+
+        # Out-of-bounds and decreasing distances.
+        if np.any(dists_all < d_min - tol) or np.any(dists_all > d_max + tol):
+            bad = seq[(dists_all < d_min - tol) | (dists_all > d_max + tol)]
+            cb.check_trip_id(
+                trip_id,
+                "shape_dist_traveled outside shape "
+                f"{shape_id!r} at stop_sequence " + ", ".join(str(s) for s in bad[:5]),
+            )
+        if len(dists_all) >= 2 and np.any(np.diff(dists_all) < -tol):
+            bad = seq[1:][np.diff(dists_all) < -tol]
+            cb.check_trip_id(
+                trip_id,
+                "shape_dist_traveled decreases with stop_sequence at "
+                + ", ".join(str(s) for s in bad[:5]),
+            )
+
+        # Departure times; only timed stops participate in interpolation.
+        dep = group["departure_time"].map(hp.timestr_to_seconds)
+        dep_values = dep.to_numpy(dtype=float, na_value=np.nan)
+        timed = ~pd.isna(dep_values)
+        if not timed.any():
+            continue
+        timed_times = dep_values[timed]
+        timed_dists = dists_all[timed]
+
+        # Departure times must not go backwards along the trip.
+        if len(timed_times) >= 2 and np.any(np.diff(timed_times) < 0):
+            cb.check_trip_id(
+                trip_id,
+                "departure_time decreases with stop_sequence",
+            )
+
+        # Collapse repeated times, but reject one time pointing at two
+        # different distances.
+        points = {}
+        for t, d in zip(timed_times, timed_dists):
+            if t in points:
+                if abs(points[t] - d) > tol:
+                    cb.check_trip_id(
+                        trip_id,
+                        f"departure_time {hp.seconds_to_timestr(t)} points at "
+                        "two different shape_dist_traveled values "
+                        f"({points[t]!r} and {float(d)!r})",
+                    )
+                continue
+            points[t] = float(d)
+
+        if len(points) < 2:
+            # Not enough distinct times to interpolate.
+            continue
+
+        point_times = np.array(sorted(points), dtype=float)
+        point_dists = np.array([points[t] for t in point_times], dtype=float)
+
+        keep = (sample_times >= point_times[0]) & (sample_times <= point_times[-1])
+        ts = sample_times[keep]
+        if ts.size == 0:
+            continue
+        ds = np.interp(ts, point_times, point_dists)
+
+        d_first = point_dists[0]
+        d_last = point_dists[-1]
+        if d_last > d_first:
+            rel = (ds - d_first) / (d_last - d_first)
+            rel = np.clip(rel, 0.0, 1.0)
+        else:
+            # First and last distances coincide: report zero relative
+            # distance, as specified.
+            rel = np.zeros_like(ds)
+
+        if shape_id not in geoms:
+            geoms[shape_id] = cb.build_shape_geometries({shape_id: record}, [shape_id])[
+                shape_id
+            ]
+        geom = geoms[shape_id]
+
+        route_id = info["route_id"] if info is not None else np.nan
+        direction_id = info["direction_id"] if info is not None else np.nan
+        for t, r, d in zip(ts, rel, ds):
+            lon, lat, _, _, _, _ = geom.locate_distance(float(d))
+            rows.append(
+                {
+                    "route_id": route_id,
+                    "trip_id": trip_id,
+                    "direction_id": direction_id,
+                    "shape_id": shape_id,
+                    "time": hp.seconds_to_timestr(int(round(float(t)))),
+                    "rel_dist": float(r),
+                    "lon": lon,
+                    "lat": lat,
+                }
+            )
+
+    columns = [
+        "shape_id",
+        "trip_id",
+        "time",
+        "rel_dist",
+        "route_id",
+        "direction_id",
+        "lon",
+        "lat",
+    ]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        ["trip_id", "time", "rel_dist"], ignore_index=True
+    )
+
+
+def locate_trips(
+    feed: "Feed", date: str, times: list[str], *, calibrated: bool = False
+) -> pd.DataFrame:
     """
     Return the positions of all trips active on the
     given date (YYYYMMDD date string) and times (HH:MM:SS time strings,
@@ -429,7 +669,34 @@ def locate_trips(feed: "Feed", date: str, times: list[str]) -> pd.DataFrame:
 
     Assume ``feed.stop_times`` has an accurate
     ``shape_dist_traveled`` column.
+
+    If ``calibrated`` is true, then use the calibrated vertex distance ruler
+    of each shape, as prepared by
+    :func:`~gtfs_kit.shapes.append_dist_to_shapes` with ``calibrated=True``
+    and filled in by
+    :func:`~gtfs_kit.stop_times.append_dist_to_stop_times` with
+    ``calibrated=True``:
+
+    - Only trips active on ``date`` are considered; times past 24:00 still
+      belong to that service day.
+    - Distances are interpolated linearly in time between stops that have
+      departure times, and mapped to longitude/latitude with the vertex
+      ruler.
+    - ``rel_dist`` runs from 0 at the first timed stop to 1 at the last timed
+      stop.  If those two distances coincide, ``rel_dist`` is 0.
+    - Query times outside a trip's first/last timed stop produce no row, and
+      trips without a ``shape_id`` or with fewer than two distinct timed
+      stops are skipped.
+    - Missing, out-of-bounds, or decreasing (along ``stop_sequence``)
+      distances, decreasing departure times, and a single departure time
+      mapped to two different distances raise a ``ValueError`` naming the
+      ``trip_id``.
+
+    In both modes the input feed is not modified.
     """
+    if calibrated:
+        return _locate_trips_calibrated(feed, date, times)
+
     if not hp.is_not_null(feed.stop_times, "shape_dist_traveled"):
         raise ValueError(
             "feed.stop_times needs to have a non-null shape_dist_traveled "
