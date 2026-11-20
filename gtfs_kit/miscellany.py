@@ -518,6 +518,12 @@ def compute_network_time_series(
     -----
     - If you've already computed trip stats in your workflow, then you should pass
       that table into this function to speed things up significantly.
+    - The ``num_trips`` values agree with those of
+      :func:`.routes.compute_route_time_series`: a trip active in several
+      route bins counts once in each, and summing route ``num_trips``
+      across routes yields the network value.
+    - The result carries provenance metadata in ``.attrs`` so it can be
+      coarsened exactly by :func:`.helpers.downsample`.
 
     """
     final_cols = [
@@ -544,7 +550,12 @@ def compute_network_time_series(
 
     if split_route_types:
         group_keys = ["datetime", "route_type"]
-        rts = rts.merge(trip_stats.filter(["route_id", "route_type"]), how="left")
+        rts = rts.merge(
+            trip_stats.filter(["route_id", "route_type"]).drop_duplicates(
+                ["route_id"]
+            ),
+            how="left",
+        )
     else:
         group_keys = ["datetime"]
 
@@ -564,6 +575,10 @@ def compute_network_time_series(
         .fillna(0.0)
     )
 
+    meta = hp.get_time_series_meta(rts)
+    meta.setdefault("freq_ns", hp.freq_to_ns(freq))
+    f = f.filter(final_cols)
+    f.attrs[hp.TIME_SERIES_META_KEY] = {**meta, "kind": "network"}
     return f
 
 

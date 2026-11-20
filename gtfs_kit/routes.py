@@ -702,22 +702,33 @@ def compute_route_time_series_0(
 
     Notes
     -----
-    - Trips that lack start or end times are ignored, so the the
-      aggregate ``num_trips`` across the day could be less than the
-      ``num_trips`` column of :func:`compute_route_stats_0`
+    - Bin ``k`` covers the half-open interval
+      ``[k * freq, (k + 1) * freq)`` of the service day.  Bin boundaries
+      are measured from midnight and are computed with second (actually
+      nanosecond) precision, so trip start/end times that fall on
+      seconds are handled correctly.
+    - Trips that lack start or end times, or that have zero duration,
+      are ignored, so the aggregate ``num_trips`` across the day could be
+      less than the ``num_trips`` column of :func:`compute_route_stats_0`
+    - ``num_trips`` counts the distinct trips that run for a positive
+      amount of time inside the bin.  A trip that ends exactly at the
+      left edge of a bin is not counted as running in that bin.
+    - ``num_trip_starts`` and ``num_trip_ends`` are event counts binned
+      by the time at which the event occurs.
+    - ``service_duration`` only includes the part of each trip that falls
+      inside the bin, and ``service_distance`` is allocated in proportion
+      to time (constant-speed assumption within each trip).
     - All trip departure times are taken modulo 24 hours.
-      So routes with trips that end past 23:59:59 will have all
-      their stats wrap around to the early morning of the time series,
-      except for their ``num_trip_ends`` indicator.
-      Trip endings past 23:59:59 are not binned so that resampling the
-      ``num_trips`` indicator works efficiently.
-    - Note that the total number of trips for two consecutive time bins
-      t1 < t2 is the sum of the number of trips in bin t2 plus the
-      number of trip endings in bin t1.
-      Thus we can downsample the ``num_trips`` indicator by keeping
-      track of only one extra count, ``num_trip_ends``, and can avoid
-      recording individual trip IDs.
-    - All other indicators are downsampled by summing.
+      So trips that end past 23:59:59 will have their stats wrap around
+      to the early morning of the time series, except for their
+      ``num_trip_ends`` indicator: trip endings past 23:59:59 are not
+      binned, preserving the original cross-midnight convention.
+    - Because a trip's start event never precedes the first bin in which
+      it runs, the distinct-trip count of a coarser bin that is a union
+      of fine bins is
+      ``num_trips(first fine bin) + sum(num_trip_starts of the other
+      fine bins)``.  This is what :func:`.helpers.downsample` uses to
+      coarsen the table exactly without recording trip IDs.
     - Raise a ValueError if ``split_directions`` and no non-null
       direction ID values present
 
@@ -741,8 +752,15 @@ def compute_route_time_series_0(
     if trip_stats.empty:
         return null_stats
 
+    freq_ns = hp.freq_to_ns(freq)
+    day_ns = hp._SECONDS_PER_DAY * hp._NS_PER_SECOND
+    num_bins = -(-day_ns // freq_ns)  # Ceiling division
+    ns_per_sec = hp._NS_PER_SECOND
+
     tss = trip_stats.copy()
     if split_directions:
+        if "direction_id" not in tss.columns:
+            tss["direction_id"] = pd.NA
         tss = tss.loc[lambda x: x.direction_id.notnull()].assign(
             direction_id=lambda x: x.direction_id.astype(int)
         )
@@ -757,11 +775,9 @@ def compute_route_time_series_0(
             tss["route_id"] + "-" + tss["direction_id"].map(lambda x: str(int(x)))
         )
 
-    routes = tss["route_id"].unique()
+    tss = tss.loc[lambda x: x["route_id"].notnull()]
+    routes = sorted(tss["route_id"].unique().tolist())
 
-    # Build a dictionary of time series and then merge them all
-    # at the end.
-    # Assign a uniform generic date for the index
     indicators = [
         "num_trip_starts",
         "num_trip_ends",
@@ -770,77 +786,114 @@ def compute_route_time_series_0(
         "service_distance",
     ]
 
-    # Bin start and end times
-    bins = [i for i in range(24 * 60)]  # One bin for each minute
-    num_bins = len(bins)
-
-    def timestr_to_min(x):
-        return hp.timestr_to_seconds(x, mod24=True) // 60
-
-    tss["start_index"] = tss["start_time"].map(timestr_to_min)
-    tss["end_index"] = tss["end_time"].map(timestr_to_min)
-
-    # Bin each trip according to its start and end time and weight
-    routes = sorted(tss["route_id"].dropna().unique().tolist())
-    series_by_route_by_indicator = {
-        indicator: {route: [0 for i in range(num_bins)] for route in routes}
+    # One zero-filled array per route per indicator, indexed by bin number.
+    # This is O(number of bins) per route, not per trip per second.
+    values = {
+        indicator: {route: np.zeros(num_bins, dtype=float) for route in routes}
         for indicator in indicators
     }
+
+    wrapped_any = False
     for row in tss.itertuples(index=False):
         route = row.route_id
-        start = row.start_index
-        end = row.end_index
-        distance = row.distance
+        start = hp.timestr_to_seconds(row.start_time, mod24=True)
+        end = hp.timestr_to_seconds(row.end_time, mod24=True)
 
         # Ignore defunct trips
-        if pd.isna(start) or pd.isna(end) or start == end:
+        if pd.isna(start) or pd.isna(end):
+            continue
+        start = int(start)
+        end = int(end)
+        if start == end:
             continue
 
-        # Get bins to fill
-        if start < end:
-            bins_to_fill = bins[start:end]
-        else:
-            bins_to_fill = bins[start:] + bins[:end]
+        start_ns = start * ns_per_sec
+        end_ns = end * ns_per_sec
+        wrapped = start > end
+        wrapped_any = wrapped_any or wrapped
+        total_ns = end_ns - start_ns if not wrapped else day_ns - start_ns + end_ns
+        if total_ns <= 0:
+            continue
 
-        # Bin trip and calculate indicators.
-        # Num trip starts.
-        series_by_route_by_indicator["num_trip_starts"][route][start] += 1
+        distance = row.distance
+        if pd.isna(distance):
+            distance = 0.0
 
-        # Num trip ends.
-        # Don't mark trip ends for trips that run past midnight;
-        # allows for easy resampling of num_trips later.
-        if start <= end:
-            series_by_route_by_indicator["num_trip_ends"][route][end] += 1
+        # Active intervals of the trip within the service day
+        segments = (
+            [(start_ns, day_ns), (0, end_ns)]
+            if wrapped
+            else [(start_ns, end_ns)]
+        )
 
-        # Do rest of indicators
-        for indicator in indicators[2:]:
-            if indicator == "num_trips":
-                weight = 1
-            elif indicator == "service_duration":
-                weight = 1 / 60
-            else:
-                weight = distance / len(bins_to_fill)
-            for b in bins_to_fill:
-                series_by_route_by_indicator[indicator][route][b] += weight
+        for segment_number, (a, b) in enumerate(segments):
+            if b <= a:
+                continue
+            # Bins touched by [a, b), with b exclusive
+            first_bin = a // freq_ns
+            last_bin = (b - 1) // freq_ns
+            weight = distance / total_ns
 
-    # Build per-indicator DataFrames indexed by minute across the provided date
-    rng = pd.date_range(
-        pd.to_datetime(f"{date_label} 00:00:00"), periods=24 * 60, freq="Min"
-    )
-    series_by_indicator = {
-        indicator: pd.DataFrame(
-            series_by_route_by_indicator[indicator], index=rng
-        ).fillna(0)
-        for indicator in indicators
-    }
+            # The two segments of a wrapped trip are disjoint in time, so
+            # they share a bin only when that single bin covers the whole
+            # day.  In that case count the trip once.
+            count_trip = not (num_bins == 1 and segment_number > 0)
+
+            def add_overlap(k, overlap_ns):
+                if count_trip:
+                    values["num_trips"][route][k] += 1
+                values["service_duration"][route][k] += (
+                    overlap_ns / ns_per_sec / 3600
+                )
+                values["service_distance"][route][k] += weight * overlap_ns
+
+            if first_bin == last_bin:
+                add_overlap(first_bin, b - a)
+                continue
+
+            # Partial first and last bins
+            add_overlap(first_bin, (first_bin + 1) * freq_ns - a)
+            add_overlap(last_bin, b - last_bin * freq_ns)
+
+            # Interior bins are fully covered; fill them with slice arithmetic
+            # rather than an O(bins) Python loop.
+            interior = slice(first_bin + 1, last_bin)
+            if interior.stop > interior.start:
+                if count_trip:
+                    values["num_trips"][route][interior] += 1
+                values["service_duration"][route][interior] += (
+                    freq_ns / ns_per_sec / 3600
+                )
+                values["service_distance"][route][interior] += weight * freq_ns
+
+        # Trip start event
+        values["num_trip_starts"][route][start_ns // freq_ns] += 1
+
+        # Trip end event (cross-midnight ends keep being excluded)
+        if not wrapped:
+            values["num_trip_ends"][route][end_ns // freq_ns] += 1
+
+    # Build per-indicator DataFrames indexed by bin start across the given date
+    base = pd.Timestamp(pd.to_datetime(date_label, format="%Y%m%d"))
+    rng = pd.date_range(base, periods=num_bins, freq=freq)
+    series_by_indicator = {}
+    for indicator, by_route in values.items():
+        frame = pd.DataFrame(by_route, index=rng)
+        if indicator in ("num_trip_starts", "num_trip_ends", "num_trips"):
+            # These are event/entity counts; keep them integral, as before.
+            frame = frame.round().astype("int64")
+        series_by_indicator[indicator] = frame
 
     # Combine into a single long-form time series per route (and direction if requested);
     # hp.combine_time_series is expected to compute derived fields like service_speed
     g = hp.combine_time_series(
         series_by_indicator, kind="route", split_directions=split_directions
     )
-    # Downsample to requested frequency (sum for counts/durations/distances; speed handled by helper)
-    return hp.downsample(g, freq=freq)
+    # Present the documented column order
+    g = g.filter(final_cols)
+    return hp.set_time_series_meta(
+        g, kind="route", freq_ns=freq_ns, wrapped=wrapped_any
+    )
 
 
 def compute_route_time_series(
@@ -885,6 +938,11 @@ def compute_route_time_series(
     If all dates lie outside the Feed's date range, then return an
     empty DataFrame.
 
+    The result also carries provenance metadata in ``.attrs`` (see
+    :func:`.helpers.downsample`), so it can later be coarsened exactly,
+    e.g. from '1min' to '5min' to '15min', with counts matching a table
+    computed directly at the coarse frequency.
+
     Notes
     -----
     - If you've already computed trip stats in your workflow, then you should pass
@@ -903,6 +961,7 @@ def compute_route_time_series(
     if not dates:
         return null_stats
 
+    freq_ns = hp.freq_to_ns(freq)
     activity = feed.compute_trip_activity(dates)
     if trip_stats is None:
         trip_stats = feed.compute_trip_stats()
@@ -917,6 +976,7 @@ def compute_route_time_series(
     stats_by_ids = {}
     activity = feed.compute_trip_activity(dates)
     frames = []
+    wrapped = False
     for date in dates:
         ids = tuple(sorted(activity.loc[activity[date] > 0, "trip_id"].values))
         if ids in stats_by_ids:
@@ -927,7 +987,9 @@ def compute_route_time_series(
             t = trip_stats.loc[lambda x: x.trip_id.isin(ids)].copy()
             stats = compute_route_time_series_0(
                 t, split_directions=split_directions, freq=freq, date_label=date
-            ).pipe(hp.replace_date, date=date)
+            )
+            wrapped = wrapped or bool(hp.get_time_series_meta(stats).get("wrapped"))
+            stats = stats.pipe(hp.replace_date, date=date)
             # Remember stats
             stats_by_ids[ids] = stats
         else:
@@ -936,4 +998,7 @@ def compute_route_time_series(
         frames.append(stats)
 
     # Collate stats
-    return pd.concat(frames, ignore_index=True)
+    result = pd.concat(frames, ignore_index=True)
+    return hp.set_time_series_meta(
+        result, kind="route", freq_ns=freq_ns, wrapped=wrapped
+    )
